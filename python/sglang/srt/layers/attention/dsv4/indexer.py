@@ -63,6 +63,16 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 _arange_cache = {}
 
+# deep_gemm's indexer kernels assert `arch_major in {9, 10}` inside the kernel
+# (csrc/apis/attention.hpp), so every other CUDA architecture has to take the
+# paged fallback. Naming the architectures that *do* have the kernel keeps the
+# polarity right: anything not enumerated degrades instead of dying.
+_DEEP_GEMM_INDEXER_CAPABILITIES = (9, 10)
+_has_deep_gemm_indexer = (
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] in _DEEP_GEMM_INDEXER_CAPABILITIES
+)
+
 
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
@@ -574,6 +584,11 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
+        # ... and architectures whose deep_gemm build has no indexer kernel:
+        # the assertion lives inside the kernel, so reaching it kills the
+        # scheduler rather than raising something a fallback could catch.
+        if not _has_deep_gemm_indexer:
+            return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
@@ -794,9 +809,38 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if is_sm120_supported():
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or (
+            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8
+        ):
+            # The second disjunct routes Ampere here by default: deep_gemm's
+            # indexer kernels gate themselves to arch_major in {9, 10}, so the
+            # default branch below cannot serve SM8x at all -- requiring an env
+            # var to avoid a guaranteed crash would just be a trap.
+            if is_sm120_supported() or (
+                torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8
+            ):
+                # Ampere needs the same CUDA-graph-safe variant (no .item())
                 fn = fp8_paged_mqa_logits_torch_sm120
+                if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+                    # Explicit env request: keep the torch reference variant
+                    # as the debug escape hatch instead of overriding it.
+                    pass
+                else:
+                    # Every call takes the fused Triton kernel: same operator,
+                    # but neither the [B, S, num_heads] intermediate nor the
+                    # torch path's [B, max_pages, 8448] KV gather is ever
+                    # materialised. That gather made decode pay for the
+                    # configured context ceiling on every step (~553 MB/layer
+                    # at a 1M ceiling; single-stream decode measured 12.5 vs
+                    # 27.3 tok/s with the ceiling as the only variable). The
+                    # kernel reads pages in-kernel, is shape-static, and has
+                    # no d2h sync, so CUDA graph capture takes it fine — the
+                    # path proved to be exactly the ceiling tax.
+                    from sglang.kernels.ops.attention.dsv4.fused_paged_indexer import (
+                        fused_paged_mqa_logits,
+                    )
+
+                    fn = fused_paged_mqa_logits
             else:
                 fn = fp8_paged_mqa_logits_torch
         elif is_xpu():
