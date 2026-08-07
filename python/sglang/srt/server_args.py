@@ -83,6 +83,7 @@ from sglang.srt.utils.common import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
+    is_sm80_supported,
     is_sm90_supported,
     is_sm100_or_sm110_supported,
     is_sm100_supported,
@@ -5308,6 +5309,33 @@ class ServerArgs:
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+            elif is_sm80_supported():
+                # Compute capability 8.x (Ampere and Ada). DeepGEMM is not built
+                # below SM90 -- the wrapper already reports
+                # ENABLE_JIT_DEEPGEMM=False -- but the mHC prenorm path is
+                # selected by its own env flag and calls into the module
+                # regardless, so the flag has to be cleared here too. topk_v2's
+                # JIT source needs thread-block clusters (cg::this_cluster()),
+                # which arrive with SM90.
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                # The c4 indexer routes itself off DeepGEMM for capability 8.x
+                # (see dsv4/indexer.py) -- SGLANG_FP8_PAGED_MQA_LOGITS_TORCH is
+                # deliberately NOT set here, because that flag is the debug
+                # escape hatch that pins the torch reference variant and would
+                # keep Ampere off the fused kernel.
+                if get_device_sm() < 89:
+                    # ...and on Ampere proper that portable path must not be
+                    # TileLang either: its kernel issues
+                    # SM89_16x8x32_F32E4M3E4M3F32_TN, an FP8 MMA that does not
+                    # exist before SM89. Ada has the instruction, so leave its
+                    # TileLang selection alone.
+                    envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(False)
+                # The FlashInfer sparse-MLA path is CUTLASS-compiled for SM120
+                # only; the portable Triton implementation is the one that runs
+                # here.
+                envs.SGLANG_SM120_FLASHMLA_BACKEND.set("triton")
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
