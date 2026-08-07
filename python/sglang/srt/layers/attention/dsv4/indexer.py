@@ -179,6 +179,7 @@ def fp8_paged_mqa_logits_torch_sm120(
     deep_gemm_metadata: Any,
     max_seq_len: int,
     clean_logits: bool = True,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
     _ = deep_gemm_metadata
@@ -188,22 +189,31 @@ def fp8_paged_mqa_logits_torch_sm120(
 
     _QUERY_CHUNK = 1024
     if batch_size > _QUERY_CHUNK:
-        return torch.cat(
-            [
-                fp8_paged_mqa_logits_torch_sm120(
-                    q_fp8[start : start + _QUERY_CHUNK],
-                    kvcache_fp8,
-                    weight[start : start + _QUERY_CHUNK],
-                    seq_lens[start : start + _QUERY_CHUNK],
-                    page_table[start : start + _QUERY_CHUNK],
-                    deep_gemm_metadata,
-                    max_seq_len,
-                    clean_logits=clean_logits,
-                )
-                for start in range(0, batch_size, _QUERY_CHUNK)
-            ],
-            dim=0,
-        )
+        # Write each query chunk straight into one preallocated output. The
+        # previous torch.cat kept every sub-call's [chunk, max_seq_len] fp32
+        # output alive simultaneously, plus the concatenation -- at 1M context
+        # with B=8192 that is twice ~8.6 GB before any scoring work, and it is
+        # what OOMed after the chunk-size budget was fixed. The loop caps the
+        # transient at a single sub-output.
+        if out is None:
+            out = torch.empty(
+                (batch_size, max_seq_len),
+                dtype=torch.float32,
+                device=q_fp8.device,
+            )
+        for start in range(0, batch_size, _QUERY_CHUNK):
+            fp8_paged_mqa_logits_torch_sm120(
+                q_fp8[start : start + _QUERY_CHUNK],
+                kvcache_fp8,
+                weight[start : start + _QUERY_CHUNK],
+                seq_lens[start : start + _QUERY_CHUNK],
+                page_table[start : start + _QUERY_CHUNK],
+                deep_gemm_metadata,
+                max_seq_len,
+                clean_logits=clean_logits,
+                out=out[start : start + _QUERY_CHUNK],
+            )
+        return out
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
     assert (
@@ -219,36 +229,111 @@ def fp8_paged_mqa_logits_torch_sm120(
     assert clean_logits == False
 
     max_pages = (max_seq_len + block_size - 1) // block_size
-    max_padded_seq = max_pages * block_size
 
     kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
     SCALE_OFFSET = block_size * head_dim
 
     page_ids = page_table[:, :max_pages]
-    kvcache_gathered = kvcache_flat[page_ids]
 
-    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
-    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
+    # Chunk along the sequence axis. The unchunked form materialises a
+    # [B, S, num_heads] score tensor -- num_heads times larger than the [B, S]
+    # it reduces to, and growing linearly with context -- which OOMs at 512K.
+    # Chunking is bit-identical: each output element reduces over head_dim only,
+    # so no reduction ever crosses a chunk boundary.
+    q = q_fp8[:, 0].to(torch.bfloat16)  # [B, NH, 128]
+    # The output dtype has to match the unchunked path: there the score is
+    # multiplied by fp32 weight/kv_scale, so it lands in fp32.
+    # Writing into a caller-provided buffer removes the last full-output-size
+    # transient in the chunked path: without it every 1024-row sub-call
+    # allocates its own [chunk, max_seq_len] fp32 before the copy -- the third
+    # and final allocation site the 1M OOM walked to.
+    # This reference path keeps the full-width -inf contract (registered
+    # tests assert it, and callers may compare the invalid region bitwise).
+    # The hot decode path routes to the fused kernel instead, which never
+    # pays this O(max_ctx) fill.
+    if out is not None:
+        logits = out
+        logits.fill_(float("-inf"))
+    else:
+        logits = torch.full(
+            (batch_size, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+    # Peak per gathered KV token: bf16 values (head_dim * 2) + bf16 scores
+    # (num_heads * 2) + the fp32 product the weighted head sum materialises
+    # (num_heads * 4). That last term was missing from the budget: the cap
+    # held the score tensor to ~512 MB but not the score-times-weight product,
+    # which is twice its size -- at 1M context with B=8192 all eight ranks
+    # OOMed on exactly that line while the budget believed it had headroom.
+    _per = max(1, batch_size * (head_dim * 2 + num_heads * 6))
+    pages_per_chunk = max(1, min(max_pages, (512 << 20) // (_per * block_size)))
 
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
-    kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
+    # Single-sequence prefill has an identical page_table on every row: all B
+    # query tokens address the same KV. Gathering per row copies it B times --
+    # around 70 GB of traffic at B=8192 with a 256K context. Gathering once and
+    # letting the bmm collapse to a single GEMM divides that traffic by B.
+    #
+    # The `.all()` check below is a device-to-host sync, which raises
+    # "operation not permitted when stream is capturing" inside a CUDA graph, so
+    # it is guarded by a host-side query first. Capture only happens on decode,
+    # where the batch is small enough that this path would not pay off anyway.
+    _shared = (
+        batch_size > 1
+        and not torch.cuda.is_current_stream_capturing()
+        and bool((page_ids == page_ids[0:1]).all())
+    )
+    if _shared:
+        _pg = page_ids[0]  # [max_pages]
+        for _p0 in range(0, max_pages, pages_per_chunk):
+            _p1 = min(max_pages, _p0 + pages_per_chunk)
+            _g = kvcache_flat[_pg[_p0:_p1]]  # [p, 64*132] -- gathered once
+            _n = (_p1 - _p0) * block_size
+            _kvv = (
+                _g[..., :SCALE_OFFSET]
+                .contiguous()
+                .view(dtype=FP8_DTYPE)
+                .to(torch.bfloat16)
+            ).view(
+                _n, head_dim
+            )  # [n, 128]
+            _kvs = (_g[..., SCALE_OFFSET:].contiguous().view(dtype=torch.float32)).view(
+                _n
+            )  # [n]
+            # [n,128] @ [128, B*NH] -> [n, B*NH]
+            _sc = _kvv @ q.reshape(batch_size * num_heads, head_dim).t()
+            _sc = F.relu(_sc).view(_n, batch_size, num_heads)
+            _sc = (_sc * weight.unsqueeze(0)).sum(dim=2)  # [n, B]
+            _sc = _sc.t() * _kvs.unsqueeze(0)  # [B, n]
+            _s0 = _p0 * block_size
+            _e = min(max_seq_len, _s0 + _n)
+            if _e > _s0:
+                logits[:, _s0:_e] = _sc[:, : _e - _s0]
+            del _g, _kvv, _kvs, _sc
+        _done_shared = True
+    else:
+        _done_shared = False
 
-    kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
-    kv_scale = kv_scale.view(batch_size, max_padded_seq)
-
-    q = q_fp8[:, 0].to(torch.bfloat16)
-
-    score = torch.bmm(kv_value, q.transpose(1, 2))
-
-    score = F.relu(score)
-    score = score * weight.unsqueeze(1)
-    score = score.sum(dim=2)
-
-    score = score * kv_scale
-
-    out_width = min(max_padded_seq, max_seq_len)
-    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
-    logits[:, :out_width] = score[:, :out_width]
+    for _p0 in range(0, max_pages if not _done_shared else 0, pages_per_chunk):
+        _p1 = min(max_pages, _p0 + pages_per_chunk)
+        _g = kvcache_flat[page_ids[:, _p0:_p1]]
+        _n = (_p1 - _p0) * block_size
+        _kvv = (
+            _g[..., :SCALE_OFFSET].contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
+        ).view(batch_size, _n, head_dim)
+        _kvs = (_g[..., SCALE_OFFSET:].contiguous().view(dtype=torch.float32)).view(
+            batch_size, _n
+        )
+        _sc = torch.bmm(_kvv, q.transpose(1, 2))  # [B, _n, NH]
+        _sc = F.relu(_sc)
+        _sc = _sc * weight.unsqueeze(1)
+        _sc = _sc.sum(dim=2) * _kvs  # [B, _n]
+        _s0 = _p0 * block_size
+        _e = min(max_seq_len, _s0 + _n)
+        if _e > _s0:
+            logits[:, _s0:_e] = _sc[:, : _e - _s0]
+        del _g, _kvv, _kvs, _sc
 
     positions = torch.arange(max_seq_len, device=device)
     invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
