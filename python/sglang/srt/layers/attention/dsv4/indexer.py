@@ -74,6 +74,106 @@ _has_deep_gemm_indexer = (
 )
 
 
+def fold_paged_mqa_logits_approx(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """Opt-in LOSSY approximation of the C4 indexer scoring (head fold).
+
+    Folds the head dimension out before the GEMM: ``q_eff = sum_h w_h q_h``,
+    then one ``[B, D] @ [D, N]`` matmul. This computes the LINEAR operator --
+    the real operator applies a per-head ReLU between the dot product and the
+    weighted head sum, and the ReLU does not commute with the fold, so this
+    path is NOT an identity and is NOT the default. It exists for workloads
+    prepared to trade top-k fidelity for indexer speed with open eyes.
+
+    Measured costs on DeepSeek-V4-Flash-0731 (live-captured inputs, 21 C4
+    layers x {32K, 128K, 256K}; the #33271 discussion carries the full grid):
+
+    - fold-vs-exact top-512 overlap: grid mean 0.748; per-layer means
+      0.55-0.88, degrading monotonically with context length; the worst
+      layer (40) bottoms at 0.11 on single rows.
+    - ~50% of per-head products are negative at every layer and depth;
+      the ReLU removes ~46% of the |w|-weighted score mass.
+    - Task-level, controlled A/B on this branch with fold engagement
+      verified: needle 128K/256K 4/4 in both modes; GSM8K full-1319 at
+      0.942 with the fold vs 0.941 exact, same harness. What the trade
+      buys on top of the exact fused kernel: 53.9 s vs 56.3 s needle wall
+      at 128K and 112.3 s vs 141.4 s at 256K, i.e. 4-21% at these lengths.
+      Those tasks are coarse; the mechanism-level divergence above is the
+      honest picture.
+
+    Taken only for prefill-sized calls where every row shares one page table
+    (single-sequence prefill); anything else falls back to the exact fused
+    path.
+    """
+    _ = deep_gemm_metadata
+    assert clean_logits is False
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    device = q_fp8.device
+
+    shared = (
+        batch_size > 1
+        and not torch.cuda.is_current_stream_capturing()
+        and bool((page_table == page_table[0:1]).all())
+    )
+    if not shared:
+        from sglang.kernels.ops.attention.dsv4.fused_paged_indexer import (
+            fused_paged_mqa_logits,
+        )
+
+        return fused_paged_mqa_logits(
+            q_fp8,
+            kvcache_fp8,
+            weight,
+            seq_lens,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            clean_logits=clean_logits,
+        )
+
+    # Decode the shared KV once (page-level layout: an 8192-byte value block
+    # then 64 fp32 scales per page), then a single folded GEMM in fp32.
+    pages = page_table[0].clamp(min=0).long()
+    pool = kvcache_fp8.shape[0]
+    flat = kvcache_fp8.reshape(pool, 8448)
+    vals = flat[:, :8192].contiguous().view(FP8_DTYPE).reshape(pool, 64, head_dim)
+    scales = flat[:, 8192:].contiguous().view(torch.float32).reshape(pool, 64)
+    kv = vals[pages].to(torch.float32).reshape(-1, head_dim)
+    sc = scales[pages].reshape(-1)
+    n_eff = min(kv.shape[0], max_seq_len)
+
+    q_eff = (weight.float().unsqueeze(-1) * q_fp8[:, 0].float()).sum(dim=1)
+    logits = torch.full(
+        (batch_size, max_seq_len), float("-inf"), dtype=torch.float32, device=device
+    )
+    # Chunk the folded GEMM along the sequence axis. Computing it whole
+    # materialises a [B, n] fp32 product -- the size of the output -- and then a
+    # second one for the scale, so the approximation would cost 2x the output on
+    # top of the output itself: measured at +1.66 GB (128K) and +3.42 GB (256K)
+    # over the exact kernel at B=8192, which is enough to OOM a pool sized for a
+    # 1M context. One chunk at a time keeps the transient at ~256 MB.
+    step = max(64, (256 << 20) // max(1, batch_size * 4))
+    for start in range(0, n_eff, step):
+        stop = min(n_eff, start + step)
+        block = q_eff @ kv[start:stop].t()
+        block *= sc[start:stop].unsqueeze(0)
+        logits[:, start:stop] = block
+        del block
+
+    positions = torch.arange(max_seq_len, device=device)
+    invalid = positions[None, :] >= seq_lens.reshape(batch_size)[:, None]
+    logits.masked_fill_(invalid, float("-inf"))
+    return logits
+
+
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -825,6 +925,12 @@ class C4IndexerBackendMixin:
                     # Explicit env request: keep the torch reference variant
                     # as the debug escape hatch instead of overriding it.
                     pass
+                elif (
+                    envs.SGLANG_DSV4_INDEXER_FOLD_APPROX.get()
+                    and q_indexer.shape[0] >= 128
+                ):
+                    # Explicitly lossy; costs documented at the implementation.
+                    fn = fold_paged_mqa_logits_approx
                 else:
                     # Every call takes the fused Triton kernel: same operator,
                     # but neither the [B, S, num_heads] intermediate nor the
