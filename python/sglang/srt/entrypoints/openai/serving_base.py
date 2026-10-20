@@ -42,7 +42,8 @@ class OpenAIServingBase(ABC):
 
         Returns (base_model, adapter_name) or (model, None) if no colon present.
         """
-        if ":" not in model:
+        # Without LoRA a colon is part of the model name, e.g. a GGUF quant tag
+        if ":" not in model or not self.tokenizer_manager.enable_lora:
             return model, None
 
         # Split on first colon only to handle model paths with multiple colons
