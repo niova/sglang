@@ -41,6 +41,7 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+_MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
@@ -65,10 +66,24 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     return array
 
 
+def _mmap_shared_anonymous(alloc_bytes: int, extra_flags: int = 0) -> mmap.mmap:
+    """Map alloc_bytes of shared anonymous memory, readable and writable.
+
+    extra_flags is ORed into MAP_SHARED | MAP_ANONYMOUS. Raises OSError when
+    mmap() fails.
+    """
+    return mmap.mmap(
+        -1,
+        alloc_bytes,
+        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | extra_flags,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+
+
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for hugepages.
 
-    MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
+    MAP_SHARED + pre-faulting are both required so cudaHostRegister pins real,
     pre-faulted physical pages (otherwise pinning can race with COW or page
     faults and the device ends up reading stale data).
 
@@ -120,19 +135,22 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
-    mm = mmap.mmap(
-        -1,
-        alloc_bytes,
-        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
-        prot=mmap.PROT_READ | mmap.PROT_WRITE,
-    )
+    mm = _mmap_shared_anonymous(alloc_bytes)
+    # MADV_HUGEPAGE affects only later faults. shmem ignores MADV_HUGEPAGE
+    # when transparent_hugepage/shmem_enabled is never or deny.
+    try:
+        mm.madvise(_MADV_HUGEPAGE)
+    except OSError:
+        # EINVAL: kernel built without CONFIG_TRANSPARENT_HUGEPAGE.
+        pass
     try:
         # MADV_POPULATE_WRITE guarantees pages are populated and writable,
         # throwing an error on failure (e.g. out of memory).
         mm.madvise(_MADV_POPULATE_WRITE)
     except OSError:
         # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-        pass
+        mm.close()
+        mm = _mmap_shared_anonymous(alloc_bytes, _MAP_POPULATE)
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
