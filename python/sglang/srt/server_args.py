@@ -8798,7 +8798,8 @@ class ServerArgs:
         ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        if not is_runai_obj_uri(self.served_model_name):
+        lora_requested = self.enable_lora or self.lora_paths
+        if lora_requested and not is_runai_obj_uri(self.served_model_name):
             assert ":" not in self.served_model_name, (
                 "served_model_name cannot contain a colon (':') character. "
                 "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
