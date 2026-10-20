@@ -27,6 +27,7 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention import flash_mla_sm120 as fmod
+from sglang.kernels.ops.attention import flash_mla_sm120_triton as tmod
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _BYTES_PER_DST_PAGE,
     _BYTES_PER_DST_PAGE_PADDED,
@@ -47,6 +48,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
 from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
     _apply_attn_sink,
     _merge_partial_attn,
+    _sparse_decode_num_splits,
     flash_mla_sparse_decode_triton,
 )
 from sglang.srt.runtime_context import get_resources
@@ -60,6 +62,10 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 576 + 8 = 584
 
 _IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+# The Triton sparse decode kernel also compiles on SM8x, which has no fp8e4nv.
+_HAS_TRITON_SPARSE_DECODE = _IS_SM120 or (
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 8
+)
 
 
 def _build_kvcache(
@@ -347,6 +353,111 @@ class TestSparseDecodeTritonVsTorch(CustomTestCase):
             ref_out.to(torch.float32),
             atol=5e-2,
             rtol=5e-2,
+        )
+
+
+@unittest.skipUnless(
+    _HAS_TRITON_SPARSE_DECODE, "SM120 or compute capability 8.x required"
+)
+class TestSparseDecodeSplitTopk(CustomTestCase):
+    """Top-k split across the grid: same result as one program per head block."""
+
+    # DeepSeek-V4-Flash decode: 4 DSpark verify tokens, 64 heads, top-512.
+    BATCH_SIZE = 4
+    NUM_HEADS = 64
+    TOPK = 512
+    NUM_PAGES = 16
+    PAGE_SIZE = 64
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA required")
+        cls.device = torch.device("cuda")
+
+    def _inputs(self, seed: int = 21):
+        k_cache, _ = _build_kvcache(
+            self.NUM_PAGES, self.PAGE_SIZE, device=self.device, seed=seed
+        )
+        q, indices = _build_q_indices(
+            self.BATCH_SIZE,
+            self.NUM_HEADS,
+            self.TOPK,
+            self.NUM_PAGES,
+            self.PAGE_SIZE,
+            device=self.device,
+            seed=seed + 100,
+        )
+        return k_cache, q, indices
+
+    def _decode(self, num_splits, q, k_cache, indices, topk_length):
+        with mock.patch.object(
+            tmod, "_sparse_decode_num_splits", return_value=num_splits
+        ):
+            return flash_mla_sparse_decode_triton(
+                q, k_cache, indices, topk_length, None, _D, _D**-0.5
+            )
+
+    def test_split_matches_torch_reference(self):
+        k_cache, q, indices = self._inputs()
+        topk_length = torch.full(
+            (self.BATCH_SIZE,), self.TOPK, dtype=torch.int32, device=self.device
+        )
+        ref_out, _ = _sm120_sparse_decode_fwd(
+            q, k_cache, indices, topk_length, None, _D, _D**-0.5
+        )
+        for num_splits in (2, 5, 8, 13):
+            with self.subTest(num_splits=num_splits):
+                tri_out, _ = self._decode(num_splits, q, k_cache, indices, topk_length)
+                torch.testing.assert_close(
+                    tri_out.to(torch.float32),
+                    ref_out.to(torch.float32),
+                    atol=5e-2,
+                    rtol=5e-2,
+                )
+
+    def test_split_matches_unsplit(self):
+        """Rows end inside the first, a middle and the last split, so some
+        splits see no valid token."""
+        k_cache, q, indices = self._inputs(seed=33)
+        topk_length = torch.tensor(
+            [1, 17, 300, self.TOPK], dtype=torch.int32, device=self.device
+        )
+        one_out, one_lse = self._decode(1, q, k_cache, indices, topk_length)
+        for num_splits in (2, 7, 13):
+            with self.subTest(num_splits=num_splits):
+                split_out, split_lse = self._decode(
+                    num_splits, q, k_cache, indices, topk_length
+                )
+                torch.testing.assert_close(
+                    split_out.to(torch.float32),
+                    one_out.to(torch.float32),
+                    atol=2e-2,
+                    rtol=2e-2,
+                )
+                torch.testing.assert_close(split_lse, one_lse, atol=1e-3, rtol=1e-3)
+
+    def test_split_without_valid_index_gives_zero_and_dead_lse(self):
+        """attn_sink and _merge_partial_attn treat -inf as a dead branch."""
+        k_cache, q, indices = self._inputs(seed=44)
+        indices.fill_(-1)
+        out, lse = self._decode(8, q, k_cache, indices, None)
+        self.assertTrue(bool((out == 0).all()))
+        self.assertTrue(bool(torch.isneginf(lse).all()))
+
+    def test_batch_that_fills_the_sms_is_not_split(self):
+        sm_count = torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
+        self.assertGreater(
+            _sparse_decode_num_splits(
+                self.BATCH_SIZE, self.NUM_HEADS, self.TOPK, self.device
+            ),
+            1,
+        )
+        self.assertEqual(
+            _sparse_decode_num_splits(sm_count, self.NUM_HEADS, self.TOPK, self.device),
+            1,
         )
 
 

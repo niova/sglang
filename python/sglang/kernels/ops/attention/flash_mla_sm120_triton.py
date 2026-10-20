@@ -18,6 +18,7 @@ DSv4 page layout (per token, 576 bytes data + 8 bytes scales):
 Target: RTX PRO 6000 (SM120, 188 SMs, 99KB SMEM, ~1.5 TB/s GDDR7, 96MB L2)
 """
 
+import functools
 import logging
 from typing import Optional, Tuple
 
@@ -142,7 +143,7 @@ def _e4m3_to_f32(b):
             {"BLOCK_T": 32, "BLOCK_H": 32, "LOOP_STAGES": 3}, num_warps=8, num_stages=2
         ),
     ],
-    key=["topk_rounded"],
+    key=["topk_rounded", "num_splits"],
 )
 @triton.jit
 def _tiled_sparse_decode_kernel_mh(
@@ -154,6 +155,8 @@ def _tiled_sparse_decode_kernel_mh(
     topk_len_ptr,
     O_ptr,
     LSE_ptr,
+    O_part_ptr,
+    LSE_part_ptr,
     sm_scale: tl.float32,
     page_size: tl.int32,
     page_bytes: tl.int64,
@@ -167,17 +170,26 @@ def _tiled_sparse_decode_kernel_mh(
     stride_ob: tl.int32,
     stride_oh: tl.int32,
     stride_ib: tl.int32,
+    stride_pb: tl.int32,
+    stride_ps: tl.int32,
+    stride_ph: tl.int32,
+    num_splits: tl.int32,
     NOPE_PAD: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     NOPE_DIM_RT: tl.int32,
     BLOCK_T: tl.constexpr,
     BLOCK_H: tl.constexpr,
     LOOP_STAGES: tl.constexpr,
+    SPLIT_OUTPUT: tl.constexpr,
 ):
-    """Grid is (B, ceil(H / BLOCK_H)). Each KV tile is read once; QK and PV both
-    reuse it across the head dimension through tl.dot."""
+    """Grid is (B, ceil(H / BLOCK_H), num_splits). Each KV tile is read once; QK and PV both
+    reuse it across the head dimension through tl.dot.
+
+    With SPLIT_OUTPUT, each program covers one range of top-k tiles and writes
+    a normalised partial output and its LSE for the combine kernel."""
     bid = tl.program_id(0)
     hblk = tl.program_id(1)
+    split = tl.program_id(2)
 
     h_offs = hblk * BLOCK_H + tl.arange(0, BLOCK_H)  # [BLOCK_H]
     h_mask = h_offs < H
@@ -225,7 +237,14 @@ def _tiled_sparse_decode_kernel_mh(
     # the fully-masked tail tiles from being issued at all. With short
     # content the padded width made this kernel 74% of decode GPU time.
     loop_end = ((valid_topk + BLOCK_T - 1) // BLOCK_T) * BLOCK_T
-    for tile_start in tl.range(0, loop_end, BLOCK_T, num_stages=LOOP_STAGES):
+    # Splits divide the padded width, so a split past valid_topk runs no tile.
+    num_tiles = (topk + BLOCK_T - 1) // BLOCK_T
+    tiles_per_split = (num_tiles + num_splits - 1) // num_splits
+    split_begin = split * tiles_per_split * BLOCK_T
+    split_end = tl.minimum(split_begin + tiles_per_split * BLOCK_T, loop_end)
+    for tile_start in tl.range(
+        split_begin, split_end, BLOCK_T, num_stages=LOOP_STAGES
+    ):
         t_idx = tile_start + t_offs
         t_in_bounds = t_idx < topk
         t_valid = t_idx < valid_topk
@@ -334,35 +353,136 @@ def _tiled_sparse_decode_kernel_mh(
     acc_rope = acc_rope / safe_l[:, None]
     lse = tl.where(l_i > 0.0, m_i / LOG2E + tl.math.log(safe_l), float("-inf"))
 
-    o_ptrs = O_ptr + bid * stride_ob + h_offs[:, None] * stride_oh
     w_keep_o = (w_offs < (NOPE_DIM_RT // 4))[None, :]
     om = h_mask[:, None] & w_keep_o
-    tl.store(
-        o_ptrs + (w_offs * 4 + 0)[None, :],
-        (acc_n0 / safe_l[:, None]).to(tl.bfloat16),
-        mask=om,
+    if SPLIT_OUTPUT:
+        # fp32: the combine kernel rounds to bf16 once, after the weighted sum.
+        p_ptrs = (
+            O_part_ptr
+            + bid * stride_pb
+            + split * stride_ps
+            + h_offs[:, None] * stride_ph
+        )
+        tl.store(p_ptrs + (w_offs * 4 + 0)[None, :], acc_n0 / safe_l[:, None], mask=om)
+        tl.store(p_ptrs + (w_offs * 4 + 1)[None, :], acc_n1 / safe_l[:, None], mask=om)
+        tl.store(p_ptrs + (w_offs * 4 + 2)[None, :], acc_n2 / safe_l[:, None], mask=om)
+        tl.store(p_ptrs + (w_offs * 4 + 3)[None, :], acc_n3 / safe_l[:, None], mask=om)
+        tl.store(
+            p_ptrs + NOPE_DIM_RT + rope_offs[None, :], acc_rope, mask=h_mask[:, None]
+        )
+        tl.store(
+            LSE_part_ptr + (bid * num_splits + split) * H + h_offs, lse, mask=h_mask
+        )
+    else:
+        o_ptrs = O_ptr + bid * stride_ob + h_offs[:, None] * stride_oh
+        tl.store(
+            o_ptrs + (w_offs * 4 + 0)[None, :],
+            (acc_n0 / safe_l[:, None]).to(tl.bfloat16),
+            mask=om,
+        )
+        tl.store(
+            o_ptrs + (w_offs * 4 + 1)[None, :],
+            (acc_n1 / safe_l[:, None]).to(tl.bfloat16),
+            mask=om,
+        )
+        tl.store(
+            o_ptrs + (w_offs * 4 + 2)[None, :],
+            (acc_n2 / safe_l[:, None]).to(tl.bfloat16),
+            mask=om,
+        )
+        tl.store(
+            o_ptrs + (w_offs * 4 + 3)[None, :],
+            (acc_n3 / safe_l[:, None]).to(tl.bfloat16),
+            mask=om,
+        )
+        tl.store(
+            o_ptrs + NOPE_DIM_RT + rope_offs[None, :],
+            acc_rope.to(tl.bfloat16),
+            mask=h_mask[:, None],
+        )
+        tl.store(LSE_ptr + bid * H + h_offs, lse, mask=h_mask)
+
+
+@triton.jit
+def _combine_split_outputs_kernel(
+    O_part_ptr,
+    LSE_part_ptr,
+    O_ptr,
+    LSE_ptr,
+    H: tl.int32,
+    num_splits: tl.int32,
+    stride_pb: tl.int32,
+    stride_ps: tl.int32,
+    stride_ph: tl.int32,
+    stride_ob: tl.int32,
+    stride_oh: tl.int32,
+    D: tl.constexpr,
+    SPLITS_PAD: tl.constexpr,
+):
+    """Grid is (B, H). LSE-weighted sum of one head's per-split outputs."""
+    bid = tl.program_id(0)
+    hid = tl.program_id(1)
+
+    split_offs = tl.arange(0, SPLITS_PAD)
+    split_mask = split_offs < num_splits
+    lse = tl.load(
+        LSE_part_ptr + (bid * num_splits + split_offs) * H + hid,
+        mask=split_mask,
+        other=float("-inf"),
     )
-    tl.store(
-        o_ptrs + (w_offs * 4 + 1)[None, :],
-        (acc_n1 / safe_l[:, None]).to(tl.bfloat16),
-        mask=om,
+    lse_max = tl.max(lse, axis=0)
+    # No valid token in any split: keep the unsplit kernel's 0 output and -inf
+    # LSE instead of exp(-inf - -inf) = NaN.
+    has_tokens = lse_max > float("-inf")
+    lse_max = tl.where(has_tokens, lse_max, 0.0)
+    weights = tl.exp(lse - lse_max)
+    weight_sum = tl.sum(weights, axis=0)
+    safe_sum = tl.where(weight_sum > 0.0, weight_sum, 1.0)
+
+    d_offs = tl.arange(0, D)
+    parts = tl.load(
+        O_part_ptr
+        + bid * stride_pb
+        + split_offs[:, None] * stride_ps
+        + hid * stride_ph
+        + d_offs[None, :],
+        mask=split_mask[:, None],
+        other=0.0,
     )
+    out = tl.sum(parts * weights[:, None], axis=0) / safe_sum
+    tl.store(O_ptr + bid * stride_ob + hid * stride_oh + d_offs, out.to(tl.bfloat16))
     tl.store(
-        o_ptrs + (w_offs * 4 + 2)[None, :],
-        (acc_n2 / safe_l[:, None]).to(tl.bfloat16),
-        mask=om,
+        LSE_ptr + bid * H + hid,
+        tl.where(has_tokens, lse_max + tl.log(safe_sum), float("-inf")),
     )
-    tl.store(
-        o_ptrs + (w_offs * 4 + 3)[None, :],
-        (acc_n3 / safe_l[:, None]).to(tl.bfloat16),
-        mask=om,
-    )
-    tl.store(
-        o_ptrs + NOPE_DIM_RT + rope_offs[None, :],
-        acc_rope.to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-    tl.store(LSE_ptr + bid * H + h_offs, lse, mask=h_mask)
+
+
+# A split re-loads its BLOCK_H query rows, so a split shorter than this spends
+# more on Q than on KV.
+_MIN_TOKENS_PER_SPLIT = 64
+# Largest BLOCK_H of the autotune configs, so the fewest head blocks per row.
+_MAX_BLOCK_H = 64
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _sparse_decode_num_splits(
+    batch_size: int, num_heads: int, topk: int, device: torch.device
+) -> int:
+    """Top-k splits per (row, head block): enough programs to occupy every SM.
+
+    Only shapes decide, so a CUDA graph replays the split it captured.
+    """
+    programs = batch_size * triton.cdiv(num_heads, _MAX_BLOCK_H)
+    sm_count = _sm_count(device.index)
+    if programs >= sm_count:
+        return 1
+    splits_for_sms = triton.cdiv(sm_count, programs)
+    splits_for_topk = max(1, topk // _MIN_TOKENS_PER_SPLIT)
+    return min(splits_for_sms, splits_for_topk)
 
 
 def _run_triton_sparse_decode(
@@ -402,10 +522,20 @@ def _run_triton_sparse_decode(
     # Round topk for autotune key stability
     topk_rounded = triton.next_power_of_2(topk)
 
+    num_splits = _sparse_decode_num_splits(B, H, topk, q.device)
+    split_output = num_splits > 1
+    if split_output:
+        out_part = torch.empty(B, num_splits, H, D, dtype=torch.float32, device=q.device)
+        lse_part = torch.empty(B, num_splits, H, dtype=torch.float32, device=q.device)
+    else:
+        # The kernel takes these pointers but writes them only with SPLIT_OUTPUT.
+        out_part = out.unsqueeze(1)
+        lse_part = lse
+
     # Multi-head kernel: a batch of heads per program, KV read once per tile.
     # The first argument becomes an int32 view of the same buffer.
     raw_i32 = raw_uint8.view(torch.int32)
-    grid = lambda META: (B, triton.cdiv(H, META["BLOCK_H"]))
+    grid = lambda META: (B, triton.cdiv(H, META["BLOCK_H"]), num_splits)
     _tiled_sparse_decode_kernel_mh[grid](
         q3,
         raw_i32,
@@ -419,6 +549,8 @@ def _run_triton_sparse_decode(
         ),
         out,
         lse,
+        out_part,
+        lse_part,
         softmax_scale,
         page_size,
         int(page_bytes),  # page_bytes (int64)
@@ -432,10 +564,31 @@ def _run_triton_sparse_decode(
         out.stride(0),
         out.stride(1),
         flat_indices.stride(0),
+        out_part.stride(0),
+        out_part.stride(1),
+        out_part.stride(2),
+        num_splits,
         NOPE_PAD=512,
         ROPE_DIM=_ROPE_DIM,
         NOPE_DIM_RT=_NOPE_DIM,
+        SPLIT_OUTPUT=split_output,
     )
+    if split_output:
+        _combine_split_outputs_kernel[(B, H)](
+            out_part,
+            lse_part,
+            out,
+            lse,
+            H,
+            num_splits,
+            out_part.stride(0),
+            out_part.stride(1),
+            out_part.stride(2),
+            out.stride(0),
+            out.stride(1),
+            D=D,
+            SPLITS_PAD=triton.next_power_of_2(num_splits),
+        )
 
     # Return [B, 1, H, D] and [B, 1, H]
     return out.unsqueeze(1), lse.unsqueeze(1)
